@@ -10,6 +10,9 @@
 #include "../program/play.h"
 #include "../command/commandline.h"
 #include "../main.h"
+#include <boost/algorithm/string/predicate.hpp>
+#include <boost/lexical_cast.hpp>
+#include <boost/filesystem.hpp>
 
 using namespace std;
 
@@ -56,6 +59,8 @@ static const vector<string> knownCommands = {
   "set_free_handicap",
   "time_settings",
   "kgs-time_settings",
+  "kgs-game_over",
+  "kgs-chat",
   "time_left",
   "final_score",
   "final_status_list",
@@ -752,7 +757,7 @@ struct GTPEngine {
     bool allowResignation, double resignThreshold, int resignConsecTurns, double resignMinScoreDifference,
     bool logSearchInfo, bool debug, bool playChosenMove,
     string& response, bool& responseIsError, bool& maybeStartPondering,
-    AnalyzeArgs args
+    AnalyzeArgs args, double laststddev, double lastPDA
   ) {
     ClockTimer timer;
 
@@ -802,6 +807,30 @@ struct GTPEngine {
     //Play faster when winning
     double searchFactor = PlayUtils::getSearchFactor(searchFactorWhenWinningThreshold,searchFactorWhenWinning,params,recentWinLossValues,pla);
     lastSearchFactor = searchFactor;
+
+	//---------------------------------------------------------
+	// Start of game fasten up
+	// --Start of game fasten up, with high handicap even quicker to hit better opponents strength
+	if (bot->getRootHist().computeNumHandicapStones() > 1)
+	{
+		if (bot->getRootHist().moveHistory.size() < 30)
+		{
+			searchFactor = searchFactor / 2.0f + searchFactor / 2.0f * (double)bot->getRootHist().moveHistory.size() / 30.0f;
+		}
+		// End of the game fasten up
+		if (laststddev < 8.0 && laststddev > 0)
+		{
+			searchFactor = searchFactor / 2;
+			if (laststddev < 5.0)
+			{
+				searchFactor = searchFactor / 2;
+			}
+		}
+	}
+	
+	lastSearchFactor = searchFactor;
+	lastPDA = params.playoutDoublingAdvantage;
+	//---------------------------------------------------------
 
     Loc moveLoc;
     bot->setAvoidMoveUntilByLoc(args.avoidMoveUntilByLocBlack,args.avoidMoveUntilByLocWhite);
@@ -1361,6 +1390,32 @@ int MainCmds::gtp(int argc, const char* const* argv) {
   ScoreValue::initTables();
   Rand seedRand;
 
+  double maxlossscore;
+  double lastscore;
+  double laststddev;
+  double lastwinrate;
+  double lastPDA = 0.0;
+  string badmoves;
+  string goodmoves;
+  Loc lastmove;
+  string bettermove;
+  string lastbettermove;
+  string lastgoodmove;
+  string lastbadmove;
+  string lastunexpected;
+  string lastwrscore;
+  double countgoodmoves;
+  double countbadmoves;
+  double countexpectedmoves;
+  double countothermoves;
+  int chatlevel;
+  bool lastresigntalk;
+  string lastuser;
+  bool lasthintchat;
+  int lastrank;
+  bool lasthandicapchat;
+  bool hintsilence;
+
   ConfigParser cfg;
   string nnModelFile;
   string overrideVersion;
@@ -1517,6 +1572,8 @@ int MainCmds::gtp(int argc, const char* const* argv) {
   }
 
   bool currentlyAnalyzing = false;
+  string response_save;
+
   string line;
   while(getline(cin,line)) {
     //Parse command, extracting out the command itself, the arguments, and any GTP id number for the command.
@@ -1679,6 +1736,30 @@ int MainCmds::gtp(int argc, const char* const* argv) {
 
     else if(command == "clear_board") {
       engine->clearBoard();
+
+	  response_save = "";
+	  maxlossscore = 2.0;
+	  badmoves = "";
+	  goodmoves = "";
+	  lastmove = NULL;
+	  lastbadmove = "";
+	  lastgoodmove = "";
+	  lastunexpected = "";
+	  lastwrscore = "";
+	  laststddev = 0;
+	  countgoodmoves = 0;
+	  countbadmoves = 0;
+	  countexpectedmoves = 0;
+	  countothermoves = 0;
+	  chatlevel = 1;
+	  lastresigntalk = false;
+	  lasthandicapchat = false;
+	  lasthintchat = false;
+	  lastuser = "";
+	  // -2 unknown, -1 ?, else difference in strength to 9d max 9;
+	  lastrank = -2;
+	  hintsilence = false;
+
     }
 
     else if(command == "komi") {
@@ -2081,6 +2162,7 @@ int MainCmds::gtp(int argc, const char* const* argv) {
           responseIsError = true;
           response = "illegal move";
         }
+		lastmove = loc;
         maybeStartPondering = true;
       }
     }
@@ -2136,6 +2218,12 @@ int MainCmds::gtp(int argc, const char* const* argv) {
 
     else if(command == "genmove" || command == "genmove_debug" || command == "search_debug") {
       Player pla;
+	  response_save = "";
+	  lastbadmove = "";
+	  lastgoodmove = "";
+	  lastunexpected = "";
+	  lastwrscore = "";
+
       if(pieces.size() != 1) {
         responseIsError = true;
         response = "Expected one argument for genmove but got '" + Global::concat(pieces," ") + "'";
@@ -2155,8 +2243,280 @@ int MainCmds::gtp(int argc, const char* const* argv) {
           allowResignation,resignThreshold,resignConsecTurns,resignMinScoreDifference,
           logSearchInfo,debug,playChosenMove,
           response,responseIsError,maybeStartPondering,
-          GTPEngine::AnalyzeArgs()
+          GTPEngine::AnalyzeArgs(), laststddev, lastPDA
         );
+		try
+		{
+			if (engine->bot->getSearch()->getRootVisits() > 0)
+			{
+				// here move analysis
+				ostringstream xout;
+				engine->bot->getSearch()->printPV(xout, engine->bot->getSearch()->rootNode, 4);
+				lastbettermove = bettermove;
+				bettermove = Global::trim(xout.str());
+
+				ReportedSearchValues values;
+				double winLossValue;
+
+
+				double lead;
+				values = engine->bot->getSearch()->getRootValuesRequireSuccess();
+				winLossValue = values.winLossValue;
+				lead = values.lead;
+
+				//laststddev = values.expectedScoreStdev;
+
+
+			//Chatting and logging ----------------------------
+
+			//if(ogsChatToStderr) {
+				int64_t visits = engine->bot->getSearch()->getRootVisits();
+				double winrate = 0.5 * (1.0 + (values.winValue - values.lossValue));
+				double leadForPrinting = lead;
+				//Print winrate from desired perspective
+				if (perspective == P_BLACK || (perspective != P_BLACK && perspective != P_WHITE && pla == P_BLACK)) {
+					winrate = 1.0 - winrate;
+					leadForPrinting = -leadForPrinting;
+				}
+
+				double stddevdiff = 0;
+				if (laststddev != 0)
+				{
+					stddevdiff = values.expectedScoreStdev - laststddev;
+
+				}
+				laststddev = values.expectedScoreStdev;
+
+
+				double scorediff = 0;
+				if (lastscore != 0)
+				{
+					scorediff = leadForPrinting - lastscore;
+
+				}
+				lastscore = leadForPrinting;
+
+
+				if (boost::starts_with(lastbettermove, Location::toString(lastmove, 19, 19)))
+				{
+					countexpectedmoves += 1;
+				}
+				else
+				{
+					if (scorediff > 0.5)
+					{
+						countbadmoves += 1;
+					}
+					if (scorediff < -0.5)
+					{
+						countgoodmoves += 1;
+					}
+					if (scorediff >= -0.5 && scorediff <= 0.5)
+					{
+						countothermoves += 1;
+					}
+				}
+				/*if (scorediff >= -0.5 &&
+					scorediff <= 0.5 &&
+					(scorediff >= 0.3 || scorediff <= -0.3) &&
+					!boost::starts_with(lastbettermove, Location::toString(lastmove, 19, 19)))
+				{
+					if (scorediff < 0.0)
+					{
+						lastunexpected = "Interesting! " + Location::toString(lastmove, 19, 19) + " Might have won " + Global::strprintf("%.1f", -scorediff) + " points.";
+					}
+					else
+					{
+						lastunexpected = "Variation! " + Location::toString(lastmove, 19, 19) + " Might have lost " + Global::strprintf("%.1f", scorediff) + " points.";;
+					}
+					lastunexpected += " Expected was " + lastbettermove + ".";
+				}*/
+
+				// Estimation of score
+				double expRes = leadForPrinting;
+				int handicap = engine->bot->getRootHist().computeNumHandicapStones();
+				if (laststddev > 13 - handicap && handicap > 1)
+				{
+					expRes = leadForPrinting + (laststddev - (13 - handicap)) * handicap * 0.3f;
+				}
+
+				if (lastbettermove > "" && scorediff > maxlossscore / 2 &&
+					!boost::starts_with(lastbettermove, Location::toString(lastmove, 19, 19))
+					)
+				{
+					// register bad move
+					if (scorediff > maxlossscore)
+					{
+						maxlossscore = scorediff;
+					}
+					badmoves += "   " + Location::toString(lastmove, 19, 19) + ": " + Global::strprintf("%.1f", scorediff);
+					badmoves += " PV[" + lastbettermove + "]";
+					if (scorediff > maxlossscore / 1.7)
+					{
+						if (scorediff > maxlossscore / 1.3)
+						{
+							lastbadmove += " Oops... ";
+						}
+						else
+						{
+							lastbadmove += " Hm... ";
+						}
+						lastbadmove += Location::toString(lastmove, 19, 19) + " (instead of expected " + lastbettermove + ") might have lost " + Global::strprintf("%.1f", scorediff) + " points." + " Score: " + Global::strprintf(" % .1f", leadForPrinting);
+						if (expRes != -999)
+						{
+							lastbadmove += " [Stddev: " + Global::strprintf("%.1f", laststddev) + " -> ExpRes: " + Global::strprintf("%.1f", expRes) + "]";
+						}
+
+					}
+				}
+				if (lastbettermove > "" && scorediff < -0.9 && lastwinrate < 0.95 &&
+					!boost::starts_with(lastbettermove, Location::toString(lastmove, 19, 19)) &&
+					engine->bot->getParams().playoutDoublingAdvantage == lastPDA
+					)
+				{
+					// register good move
+					goodmoves += "   " + Location::toString(lastmove, 19, 19) + ": " + Global::strprintf("%.1f", -scorediff) + " points";
+					goodmoves += " PV[" + lastbettermove + "]";
+
+
+				}
+				if (lastbettermove > "" && scorediff < -0.5 && lastwinrate < 0.95
+					&& !boost::starts_with(lastbettermove, Location::toString(lastmove, 19, 19)) &&
+					engine->bot->getParams().playoutDoublingAdvantage == lastPDA
+					)
+				{
+					if (leadForPrinting < 1.0)
+					{
+						if (scorediff < -1.3)
+						{
+							lastgoodmove = "Extraordinary ";
+						}
+						else
+						{
+							lastgoodmove = "Well played! ";
+						}
+						lastgoodmove += Location::toString(lastmove, 19, 19) + " gained " + Global::strprintf("%.1f", -scorediff) + " points.";
+					}
+				}
+
+				if (engine->bot->getRootHist().moveHistory.size() > 150 && engine->bot->getRootHist().moveHistory.size() < 153 || engine->bot->getRootHist().moveHistory.size() > 200 && engine->bot->getRootHist().moveHistory.size() < 203)
+				{
+					if (lastbadmove == "")
+					{
+						double all = countgoodmoves + countbadmoves + countexpectedmoves + countothermoves;
+						if (all > 0)
+						{
+							ostringstream sout;
+
+							sout << "Move statistic of current game. Expected: " << Global::strprintf("%.1f%%", countexpectedmoves / all * 100.0)
+								<< " Extraordinary: " << Global::strprintf("%.1f%%", countgoodmoves / all * 100.0)
+								<< " Questionable: " << Global::strprintf("%.1f%%", countbadmoves / all * 100.0)
+								<< " Unexpected but fine: " << Global::strprintf("%.1f%%", countothermoves / all * 100.0)
+								;
+							lastbadmove = sout.str();
+							lastgoodmove = "";
+							lastunexpected = "";
+						}
+					}
+				}
+				if (engine->bot->getRootHist().moveHistory.size() > 156 && engine->bot->getRootHist().moveHistory.size() < 159 || engine->bot->getRootHist().moveHistory.size() > 206 && engine->bot->getRootHist().moveHistory.size() < 209)
+				{
+					if (lastbadmove == "" && goodmoves != "")
+					{
+						lastbadmove = "Good moves so far: " + goodmoves;
+					}
+				}
+				if (engine->bot->getRootHist().moveHistory.size() > 160 && engine->bot->getRootHist().moveHistory.size() < 163 || engine->bot->getRootHist().moveHistory.size() > 210 && engine->bot->getRootHist().moveHistory.size() < 213)
+				{
+					if (lastbadmove == "" && badmoves != "")
+					{
+						lastbadmove = "Bad moves so far: " + badmoves;
+					}
+				}
+				if ((int)(winrate * 10) - (int)(lastwinrate * 10) > 0 || (winrate * 100 < 10 && ((int)(winrate * 50) - (int)(lastwinrate * 50) > 0)))
+				{
+					if (lastgoodmove == "" && lastunexpected == "" && lastbadmove == "")
+					{
+						lastwrscore = "Current winrate: " + Global::strprintf("%.1f%%", winrate * 100) +
+							" (" + Global::strprintf("%.1f%%", lastwinrate * 100) + "), Score: " + Global::strprintf("%.1f", leadForPrinting) + " (PDA:" + Global::strprintf("%.3f", engine->bot->getParams().playoutDoublingAdvantage) + ")";
+						if (expRes != -999)
+						{
+							lastwrscore += " [Stddev: " + Global::strprintf("%.1f", laststddev) + " -> ExpRes: " + Global::strprintf("%.1f", expRes) + "]";
+						}
+
+					}
+				}
+				lastwinrate = winrate;
+
+				if ((leadForPrinting < -10 && (int)(leadForPrinting / 5) - (int)((leadForPrinting - scorediff) / 5) > 0) || (leadForPrinting > -10 && leadForPrinting < 0 && (int)(leadForPrinting / 3) - (int)((leadForPrinting - scorediff) / 3) > 0))
+				{
+					if (lastgoodmove == "" && lastunexpected == "" && lastbadmove == "" && lastwrscore == "")
+					{
+						lastwrscore = "Current score: " + Global::strprintf("%.1f", leadForPrinting) + " (" + Global::strprintf("%.1f", leadForPrinting - scorediff) + ")" + " (PDA:" + Global::strprintf("%.3f", engine->bot->getParams().playoutDoublingAdvantage) + ")";
+						if (expRes != -999)
+						{
+							lastwrscore += " [Stddev: " + Global::strprintf("%.1f", laststddev) + " -> ExpRes: " + Global::strprintf("%.1f", expRes) + "]";
+						}
+
+					}
+				}
+				// simplyfied game
+				if (stddevdiff < -2.0f && laststddev > 12.0f)
+				{
+					if (lastgoodmove == "" && lastbadmove == "" && lastwrscore == "")
+					{
+						lastwrscore = "Game was simplified! Current score " + Global::strprintf("%.1f", leadForPrinting);
+						if (laststddev < 10 && laststddev - stddevdiff > 10 < 10)
+						{
+							lastwrscore += " entering endgame.";
+						}
+						else
+						{
+							if (laststddev < 25 && laststddev - stddevdiff > 25) lastwrscore += " while leaving fuseki.";
+
+						}
+						if (expRes != -999)
+						{
+							lastwrscore += " [Stddev: " + Global::strprintf("%.1f", laststddev) + " -> ExpRes: " + Global::strprintf("%.1f", expRes) + "]";
+						}
+
+					}
+				}
+				// complicated game
+				if (stddevdiff > 1.7f && laststddev > 12.0f)
+				{
+					if (lastgoodmove == "" && lastbadmove == "" && lastwrscore == "")
+					{
+						lastwrscore = "Game gained complexity. Current score " + Global::strprintf("%.1f", leadForPrinting);
+						if (stddevdiff > 3.5f) lastwrscore = "Increased risk! Current score " + Global::strprintf("%.1f", leadForPrinting);
+						if (expRes != -999)
+						{
+							lastwrscore += " [Stddev: " + Global::strprintf("%.1f", laststddev) + " -> ExpRes: " + Global::strprintf("%.1f", expRes) + "]";
+						}
+					}
+
+				}
+				if (lastgoodmove == "" && lastbadmove == "" && lastwrscore == "")
+				{
+					//if (laststddev < 25 && laststddev - stddevdiff > 25) lastwrscore = "Leaving fuseki.";
+					if (laststddev < 15 && laststddev - stddevdiff > 15) lastwrscore = " Entering early endgame.";
+					if (laststddev < 10 && laststddev - stddevdiff > 10) lastwrscore = " Entering late endgame.";
+
+					if (expRes != -999 && lastwrscore != "")
+					{
+						lastwrscore += " [Stddev: " + Global::strprintf("%.1f", laststddev) + " -> ExpRes: " + Global::strprintf("%.1f", expRes) + "]";
+					}
+				}
+			}
+		}
+		catch (std::exception ex)
+		{
+			bettermove = "";
+			lastbadmove = "caught: " + Global::strprintf(ex.what());
+			lastgoodmove = "";
+			lastunexpected = "";
+			lastbettermove = "";
+		}
       }
     }
 
@@ -2185,7 +2545,7 @@ int MainCmds::gtp(int argc, const char* const* argv) {
           allowResignation,resignThreshold,resignConsecTurns,resignMinScoreDifference,
           logSearchInfo,debug,playChosenMove,
           response,responseIsError,maybeStartPondering,
-          args
+          args, laststddev, lastPDA
         );
         //And manually handle the result as well. In case of error, don't report any play.
         suppressResponse = true;
@@ -2483,6 +2843,429 @@ int MainCmds::gtp(int argc, const char* const* argv) {
         }
       }
     }
+	else if (command.find("kgs-game_over") == 0) {
+	response = "Thank you for the nice game!";
+	shouldQuitAfterResponse = true;
+	}
+
+	else if (command.find("kgs-chat") == 0) {
+	response = "";
+	if (Global::toLower(pieces[0]) == "game")
+	{
+		response = "NORESPONSE";
+		string username = pieces[1];
+		if (username.find(":") != std::string::npos) {
+			username = username.substr(0, username.length() - 1);
+		}
+		if (username == "checkingusername")
+		{
+			// check right net
+			switch (engine->bot->getRootHist().computeNumHandicapStones())
+			{
+			case 3:
+			case 4:
+				if (nnModelFile == "h4_model.bin.gz")
+				{
+					//ok
+				}
+				else
+				{
+					remove("handi2.txt");
+					remove("handi6.txt");
+					remove("handi8.txt");
+					remove("handi9.txt");
+					ofstream ofs("handi4.txt", ios_base::binary);
+					ofs << "\n";
+					shouldQuitAfterResponse = true;
+				}
+				break;
+			case 0:
+			case 1:
+			case 2:
+				if (nnModelFile == "h2_model.bin.gz")
+				{
+					//ok
+				}
+				else
+				{
+					remove("handi4.txt");
+					remove("handi6.txt");
+					remove("handi8.txt");
+					remove("handi9.txt");
+					ofstream ofs("handi2.txt", ios_base::binary);
+					ofs << "\n";
+					shouldQuitAfterResponse = true;
+				}
+				break;
+			case 5:
+			case 6:
+				if (nnModelFile == "h6_model.bin.gz")
+				{
+					//ok
+				}
+				else
+				{
+					remove("handi2.txt");
+					remove("handi4.txt");
+					remove("handi8.txt");
+					remove("handi9.txt");
+					ofstream ofs("handi6.txt", ios_base::binary);
+					ofs << "\n";
+					shouldQuitAfterResponse = true;
+				}
+				break;
+			case 8:
+			case 7:
+				if (nnModelFile == "h8_model.bin.gz")
+				{
+					//ok
+				}
+				else
+				{
+					remove("handi2.txt");
+					remove("handi4.txt");
+					remove("handi6.txt");
+					remove("handi9.txt");
+					ofstream ofs("handi8.txt", ios_base::binary);
+					ofs << "\n";
+					shouldQuitAfterResponse = true;
+				}
+				break;
+			default:
+				if (nnModelFile == "h9_model.bin.gz")
+				{
+					//ok
+				}
+				else
+				{
+					remove("handi2.txt");
+					remove("handi4.txt");
+					remove("handi6.txt");
+					remove("handi8.txt");
+					ofstream ofs("handi9.txt", ios_base::binary);
+					ofs << "\n";
+					shouldQuitAfterResponse = true;
+				}
+				break;
+				break;
+			}
+
+			if (engine->bot->getRootHist().moveHistory.size() < 2)
+			{
+				response = "Hi, use wr, gm, bm, and t0, t1, t2 to control talk about the game";
+			}
+			if (chatlevel > 0 && response == "NORESPONSE")
+			{
+				if (lastbadmove > "" || lastgoodmove > "" || lastunexpected > "")
+				{
+					ostringstream sout;
+					sout << lastbadmove << lastgoodmove << lastunexpected;
+					response = sout.str();
+				}
+
+			}
+			if (chatlevel > 0 && response == "NORESPONSE")
+			{
+				if (lastwrscore > "")
+				{
+					ostringstream sout;
+					sout << lastwrscore;
+					response = sout.str();
+				}
+			}
+
+			// say hi
+			if (chatlevel > 0 && response == "NORESPONSE" && engine->bot->getRootHist().moveHistory.size() < 4)
+			{
+				response = "I'm Katago using model:" + engine->nnEval->getInternalModelName();
+			}
+
+			// even games
+			if (chatlevel > 0 && response == "NORESPONSE" && engine->bot->getRootHist().moveHistory.size() < 6)
+			{
+				if (engine->bot->getRootHist().computeNumHandicapStones() < 2)
+				{
+					response = " Playing even, so i use my time (no fast moves).";
+				}
+			}
+
+			//
+			if (chatlevel > 1 && response == "NORESPONSE" && engine->bot->getRootHist().moveHistory.size() < 250)
+			{
+
+				int counttech = 2;
+				std::srand(std::time(0));
+				int random = rand() % (20 * (counttech + 1));
+				switch (random)
+				{
+				case 0: if (laststddev < 8.0f) response = "Playing endgame faster only " + Global::strprintf("%.1f%", laststddev) + " points left";
+					break;
+				case 1: response = Global::strprintf("%d", engine->bot->getSearch()->getRootVisits()) + " visits done";
+					break;
+				case 2: if (lastwinrate > 0.95f && laststddev < 10.0f) response = "Playing done game faster now!";
+					break;
+				default:
+					break;
+				}
+
+			}
+
+			// general hints
+			if (chatlevel > 0 && response == "NORESPONSE" && engine->bot->getRootHist().moveHistory.size() < 100)
+			{
+				int countgen = 4;
+				std::srand(std::time(0));
+				int random = rand() % (20 * (countgen + 1));
+				switch (random)
+				{
+				case 0: response = "See your statistic at http://kgs.gosquares.net/index.rhtml.en?id=" + lastuser + " If you click there on a game you get the filtered statistic versus this opponent."; break;
+				case 1: response = "See you rating graph at http://www.gokgs.com/graphPage.jsp?user=" + lastuser + ""; break;
+				case 2: response = "Private chat with me supports winrate ('wr'), good moves ('gm') and bad moves ('bm') for all!"; break;
+				case 3: response = "See katago's page at git https://github.com/lightvector/KataGo "; break;
+				case 4: response = "With chatlevel t2 I'll present occasionally random proverbs (if you don't like this type 't1' to have only comments about the game)!"; break;
+				default:
+					break;
+				}
+			}
+			// strength related
+			if (chatlevel > 0 && response == "NORESPONSE" && engine->bot->getRootHist().moveHistory.size() < 50 && lastrank >= 0 && lasthandicapchat == false)
+			{
+				if (engine->bot->getRootHist().computeNumHandicapStones() - lastrank > 1)
+				{
+					response = "I prefer to play with proper handicap. Please have confidence next time " + lastuser + "!";
+				}
+				if (engine->bot->getRootHist().computeNumHandicapStones() - lastrank < -1 && engine->bot->getRootHist().computeNumHandicapStones() < 6)
+				{
+					response = "I prefer to play with proper handicap. Please be cautiously next time " + lastuser + "!";
+				}
+				lasthandicapchat = true;
+			}
+			// strength related
+			if (chatlevel > 0 && response == "NORESPONSE" && engine->bot->getRootHist().moveHistory.size() < 50 && engine->bot->getRootHist().moveHistory.size() > 10 && engine->bot->getRootHist().computeNumHandicapStones() > 6 && lasthandicapchat == false)
+			{
+				response = "I prefer to play rated games. Please try 6 stones as maximum next time!";
+				lasthandicapchat = true;
+			}
+			// proverbs
+			if (chatlevel > 1 && response == "NORESPONSE")
+			{
+
+				int countpro = 25;
+				std::srand(std::time(0));
+				int random = rand() % (30 * (countpro + 1));
+				switch (random)
+				{
+				case 0: response = "The enemy's key point is yours!"; break;
+				case 1: response = "Play on the point of symmetry!"; break;
+				case 2: response = "Sente gains nothing!"; break;
+				case 3: response = "Beware of going back to patch up!"; break;
+				case 4: response = "When in doubt, Tenuki!"; break;
+				case 5: response = "People in glass houses shouldn't throw stones!"; break;
+				case 6: response = "There is death in the hane!"; break;
+				case 7: response = "Hane, Cut, Placement"; break;
+				case 8: response = "Don't argue with a 9d!"; break;
+				case 9: response = "Capture three to get an eye!"; break;
+				case 10: response = "Six die but eight live!"; break;
+				case 11: response = "Respond to attachment with hane!"; break;
+				case 12: response = "Crosscut then extend!"; break;
+				case 13: response = "Capture the cutting stones!"; break;
+				case 14: response = "The one-point jump is never bad!"; break;
+				case 15: response = "Don't try to cut the one-point jump!"; break;
+				case 16: response = "If you want to play like a 2d, play the double hane!"; break;
+				case 17: response = "Check escape routes first!"; break;
+				case 18: response = "Only enclosed groups can be killed!"; break;
+				case 19: response = "A three-move approach ko is not a ko!"; break;
+				case 20: response = "Hane at the Head of Two Stones!"; break;
+				case 21: response = "Do not peep at cutting points!"; break;
+				case 22: response = "Never ignore a shoulder hit!"; break;
+				case 23: response = "Use contact moves for defence!"; break;
+				case 24: response = "Nets are better than ladders!"; break;
+				case 25: response = "Five liberties for tactical stability!"; break;
+				case 26: response = "In the game of go there are tons of exceptions! (especially to these proverbs) [by cj]"; break;
+				case 27: response = "Finally a real game! [by rs]"; break;
+
+				default:
+					break;
+				}
+			}
+			if (chatlevel > 0 && response == "NORESPONSE")
+			{
+				if (response == "NORESPONSE" && laststddev * 3 < lastscore && lastwinrate > 0.9 && lastscore > 20 && !lastresigntalk)
+				{
+					response = "Perhaps it might be more proper to resign and start a new game";
+					lastresigntalk = true;
+				}
+				if (response == "NORESPONSE" && !hintsilence)
+				{
+					response = "If you want me to keep quiet, please type t0. (For maximum talking type t2)";
+					hintsilence = true;
+				}
+			}
+
+		}
+		else
+		{
+
+			if (lastuser == "") lastuser = username;
+			lastrank = -1;
+			if (pieces[2].find("[") != std::string::npos && lastrank < 0) {
+				if (pieces[2].find("k") != std::string::npos) {
+					lastrank = 9;
+				}
+				if (pieces[2].find("d") != std::string::npos) {
+					lastrank = 9 - std::stoi(pieces[2].substr(pieces[2].find("d") - 1, 1));
+				}
+				// pro
+				if (pieces[2].find("p") != std::string::npos) {
+					lastrank = 0;
+				}
+			}
+			else
+			{
+			}
+			if (Global::toLower(pieces[pieces.size() - 1]) == "wr" || Global::toLower(pieces[pieces.size() - 1]) == "score") {
+				ostringstream chat;
+				response = response_save;
+				chat << " (";
+				if (engine->bot->getSearch()->getRootVisits() > 0)
+				{
+					// here move analysis
+					ostringstream xout;
+					xout << " (";
+					engine->bot->getSearch()->printPV(xout, engine->bot->getSearch()->rootNode, analysisPVLen);
+					xout << ")";
+					response = response_save + xout.str();
+				}
+
+			}
+			if (Global::toLower(pieces[pieces.size() - 1]) == "hi")
+			{
+				response = "Have a nice game " + lastuser + "!";
+			}
+			if (Global::toLower(pieces[pieces.size() - 1]) == "bm")
+			{
+				if (badmoves > "")
+				{
+					response = "Moves that lost points so far: " + badmoves;
+				}
+				else
+				{
+					response = "No bad moves yet :-)";
+				}
+			}
+			if (Global::toLower(pieces[pieces.size() - 1]) == "gm")
+			{
+				if (goodmoves > "")
+				{
+					response = "Moves that gained points so far: " + goodmoves;
+				}
+				else
+				{
+					response = "No exordinary moves yet.";
+				}
+			}
+			if (Global::toLower(pieces[pieces.size() - 1]) == "t0")
+			{
+				response = "Silence is requested";
+				chatlevel = 0;
+			}
+			if (Global::toLower(pieces[pieces.size() - 1]) == "t1")
+			{
+				response = "I'll give some hint's and messages about the current game";
+				chatlevel = 1;
+			}
+			if (Global::toLower(pieces[pieces.size() - 1]) == "t2")
+			{
+				response = "I'm talking all the time :-)";
+				chatlevel = 2;
+			}
+			if (response == "NORESPONSE" && !lasthintchat && chatlevel > 1)
+			{
+				response = "Hi " + username + ". Please use any of the available commands (wr, bm, gm, t0-t2, hi)";
+				lasthintchat = true;
+			}
+
+		}
+	}
+	if (Global::toLower(pieces[0]) == "private")
+	{
+		response = "private";
+		if (Global::toLower(pieces[2]) == "wr" || Global::toLower(pieces[2]) == "score") {
+			ostringstream chat;
+			response = response_save;
+			chat << " (";
+			if (engine->bot->getSearch()->getRootVisits() > 0)
+			{
+				// here move analysis
+				ostringstream xout;
+				xout << " (";
+				engine->bot->getSearch()->printPV(xout, engine->bot->getSearch()->rootNode, analysisPVLen);
+				xout << ")";
+				response = response_save + xout.str();
+			}
+
+		}
+		if (Global::toLower(pieces[2]) == "t0")
+		{
+			chatlevel = 0;
+			response = "chatlevel 0";
+		}
+		if (Global::toLower(pieces[2]) == "t1")
+		{
+			chatlevel = 1;
+			response = "chatlevel 1";
+		}
+		if (Global::toLower(pieces[2]) == "t2")
+		{
+			chatlevel = 2;
+			response = "chatlevel 2";
+		}
+		if (Global::toLower(pieces[2]) == "st")
+		{
+			double all = countgoodmoves + countbadmoves + countexpectedmoves + countothermoves;
+			if (all > 0)
+			{
+				ostringstream sout;
+
+				sout << "Hi " + pieces[1] + "! Move statistic of current game. Expected: " << Global::strprintf("%.1f%%", countexpectedmoves / all * 100.0)
+					<< " Extraordinary: " << Global::strprintf("%.1f%%", countgoodmoves / all * 100.0)
+					<< " Questionable: " << Global::strprintf("%.1f%%", countbadmoves / all * 100.0)
+					<< " Unexpected but fine: " << Global::strprintf("%.1f%%", countothermoves / all * 100.0)
+					;
+				//cerr << " PV ";
+				//engine->bot->getSearch()->printPVForMove(cerr, engine->bot->getSearch()->rootNode, moveloc, analysisPVLen);
+				//sout << endl;
+				response = sout.str();
+			}
+			else
+			{
+				response = "No moves for statistic yet.";
+			}
+		}
+		if (Global::toLower(pieces[2]) == "bm")
+		{
+			if (badmoves > "")
+			{
+				response = "Moves that lost points so far: " + badmoves;
+			}
+			else
+			{
+				response = "No bad moves yet :-)";
+			}
+		}
+		if (Global::toLower(pieces[pieces.size() - 1]) == "gm")
+		{
+			if (goodmoves > "")
+			{
+				response = "Moves that gained points so far: " + goodmoves;
+			}
+			else
+			{
+				response = "No exordinary moves yet.";
+			}
+		}
+	}
+	}
 
     else if(command == "printsgf") {
       if(pieces.size() != 0 && pieces.size() != 1) {

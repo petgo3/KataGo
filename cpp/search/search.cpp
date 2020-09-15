@@ -534,16 +534,59 @@ void Search::runWholeSearch(
   searchBegun.store(true,std::memory_order_release);
   int64_t numNonPlayoutVisits = getRootVisits();
 
-  auto searchLoop = [this,&timer,&numPlayoutsShared,numNonPlayoutVisits,&logger,&shouldStopNow,maxVisits,maxPlayouts,maxTime](int threadIdx) {
+  auto searchLoop = [this,&timer,&numPlayoutsShared,numNonPlayoutVisits,&logger,&shouldStopNow,maxVisits,maxPlayouts,maxTime, pondering](int threadIdx) {
     SearchThread* stbuf = new SearchThread(threadIdx,*this,&logger);
 
+
     int64_t numPlayouts = numPlayoutsShared.load(std::memory_order_relaxed);
-    try {
+	int64_t mostvisits = 0;
+	int64_t secondmostvisits = 0;
+	int64_t remainingVisits = 0;
+	
+	try {
       while(true) {
         bool shouldStop =
           (numPlayouts >= 2 && maxTime < 1.0e12 && timer.getSeconds() >= maxTime) ||
           (numPlayouts >= maxPlayouts) ||
           (numPlayouts + numNonPlayoutVisits >= maxVisits);
+
+		SearchNode& node = *rootNode;
+		if (!pondering && !shouldStop && (rootNode->stats.visits) % 1000 == 0 && (rootNode->stats.visits) > 0 && timer.getSeconds() > 1)
+		{
+			mostvisits = 0;
+			secondmostvisits = 0;
+			remainingVisits = maxTime / timer.getSeconds() * (rootNode->stats.visits) - rootNode->stats.visits;
+			int numChildren = node.numChildren;
+			for (int i = 0; i < numChildren; i++) {
+				SearchNode* child = node.children[i];
+				int64_t childVisits = child->stats.visits;
+				if (childVisits > mostvisits)
+				{
+					secondmostvisits = mostvisits;
+					mostvisits = childVisits;
+				}
+				else
+				{
+					if (childVisits > secondmostvisits)
+					{
+						secondmostvisits = childVisits;
+					}
+				}
+			}
+			// remainingVisits * 2 for savetyness (LCB not mostvisited automaticly best move)
+			if (secondmostvisits + (int64_t)remainingVisits * 2 < mostvisits && mostvisits > 1000 && timer.getSeconds() > 2.0f)
+			{
+				shouldStop = true;
+				logger.write(string("Saved s: " + Global::doubleToString(maxTime - timer.getSeconds())));
+			}
+			// early stop
+			if (mostvisits / (secondmostvisits + 1) > 10 && mostvisits > 3000 && timer.getSeconds() > 2.0f)
+			{
+				shouldStop = true;
+				logger.write(string("Early saved s: " + Global::doubleToString(maxTime - timer.getSeconds()) + " " + Global::doubleToString(mostvisits) + " " + Global::doubleToString(secondmostvisits)));
+			}
+
+		}
 
         if(shouldStop || shouldStopNow.load(std::memory_order_relaxed)) {
           shouldStopNow.store(true,std::memory_order_relaxed);
